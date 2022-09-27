@@ -13,7 +13,7 @@ from sklearn import preprocessing
 def process1(y):
     #enhenc = Filter(spec_sub(y), FS / 8, FS, filter_type='Cheby1')
     enhenc = spec_sub(y)
-    # 基本操作 减掉静音，补零
+    # 减掉静音，补零
     wav = silence_filter(enhenc)
     #wav = mvn(wav)
     delta_sample = int(DT * FS)
@@ -176,14 +176,14 @@ def read_dataset(inputfiles):
     return file_list
 
 # -------------------------------------------画图------------------------------------------------
-def draw_spec(*param, name=None, save=None, a=6, b=5, show=True, bar=False):
+def draw_spec(*param, name=None, save=None, a=6, b=5, show=True, bar=False, retn=False):
     # ------------------dft parameters---------------------
     FFT=16000
     HOP=160
     WIN=512
     FS=16000
     DT=2
-    # ------------------ for color--------------------------
+    # --------------------- color --------------------------
     COLOR="coolwarm"
     # ---------------- loop to draw ------------------------
     n = len(param)
@@ -239,7 +239,7 @@ def draw_spec(*param, name=None, save=None, a=6, b=5, show=True, bar=False):
 
         pcm = plt.pcolormesh(X, Y, Mag_signal_db, shading='auto', cmap="coolwarm")
 
-        plt.xlim([0, np.shape(Mag_signal_db)[1] / FS])
+        #plt.xlim([0, np.shape(Mag_signal_db)[1] / FS])
 
         if name:
             plt.title("{}".format(name[0]))
@@ -252,6 +252,8 @@ def draw_spec(*param, name=None, save=None, a=6, b=5, show=True, bar=False):
         plt.savefig('{}.png'.format(save), dpi=600, bbox_inches="tight")
     if show:
         plt.show()
+    if retn:
+        return Mag_signal_db
 
 def plot_signals_time(titles, signals, nrows=3, ncols=5):
     fig, ax = plt.subplots(nrows, ncols, figsize=(16, 6))
@@ -286,3 +288,13 @@ def plot_spectrogram(titles, signals, title, shape=(16, 8), nrows=3, ncols=5):
             z += 1
 
     plt.show()
+
+'''
+A_signal = librosa.stft(s, n_fft=16000, hop_length=256, win_length=512) 
+Axx = np.abs(A_signal)
+Axx_db = librosa.amplitude_to_db(Axx+1e-8)
+plt.figure(figsize=(5, 6))
+Y = np.arange(0,np.shape(Axx_db)[0],1)
+X = np.arange(0,np.shape(Axx_db)[1]/FS,1/FS)
+plt.pcolormesh(X, Y, Axx_db, shading='auto', cmap="coolwarm")
+'''
