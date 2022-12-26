@@ -1,5 +1,7 @@
 # Dataset
 
-DeepShip
+[DeepShip](https://github.com/irfankamboh/DeepShip)
 
-shipsEar
+[shipsEar](https://atlanttic.uvigo.es/underwaternoise/)
+
+[AudioSet](https://research.google.com/audioset/dataset/ship.html)
