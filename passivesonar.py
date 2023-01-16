@@ -2,7 +2,7 @@
 Module containing functions cloned from https://github.com/pedrolisboa/poseidon
 To make sure not become broken when updating poseidon
 """
-
+from __future__ import division
 import math
 import warnings
 
