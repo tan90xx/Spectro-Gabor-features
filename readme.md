@@ -1,7 +1,6 @@
 # Gf+: Gabor filterbanks + PANNs + nnAudio
 
 This repo contains code for my thesis: **Ship-radiated noise recognition using spectrogram**. 
-- A variety of CNNs are trained on the DeepShip dataset. 
 - A mean average precision (mAP) of 71.6% is achieved using our proposed Gf+ system, outperforming the Cnn10 baseline of 64.1%.
 - A total number of parameters in a PyTorch model is only increased by 1.06M.
 - Allows on-the-fly spectrogram extraction and fine-tuning.
@@ -68,4 +67,8 @@ The video of demo can be viewed at: https://www.bilibili.com/video/BV1KN411y77L/
 ## Acknowledgement
 We appreciate the open source of the following projects:
 
-[Gabor Convolutional Networks](https://github.com/jxgu1016/Gabor_CNN_PyTorch)   [PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn)   [nnAudio](https://github.com/KinWaiCheuk/nnAudio)
+[Gabor Convolutional Networks](https://github.com/jxgu1016/Gabor_CNN_PyTorch)   [PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn)   [nnAudio](https://github.com/KinWaiCheuk/nnAudio) 
+
+We appreciate the open source of the following datasets:
+
+[DeepShip](https://github.com/irfankamboh/DeepShip)   [ShipsEar](https://atlanttic.uvigo.es/underwaternoise/)   [AudioSet](https://research.google.com/audioset/dataset/ship.html)
