@@ -3,8 +3,8 @@
 This repo contains code for my thesis: **Ship-radiated noise recognition using spectrogram**. 
 - A variety of CNNs are trained on the DeepShip dataset. 
 - A mean average precision (mAP) of 71.6% is achieved using our proposed Gf+ system, outperforming the Cnn10 baseline of 64.1%.
-- The total number of parameters in a PyTorch model is only increased by 1.06M.
-- All the are on-the-fly.
+- A total number of parameters in a PyTorch model is only increased by 1.06M.
+- Allows on-the-fly spectrogram extraction and fine-tuning.
 
 ## Environments
 The codebase is developed with `Python 3.7` `cuda 10.1` 
