@@ -68,4 +68,4 @@ The video of demo can be viewed at: https://www.bilibili.com/video/BV1KN411y77L/
 ## Acknowledgement
 We appreciate the open source of the following projects:
 
-[PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn)   [nnAudio](https://github.com/KinWaiCheuk/nnAudio)   [Gabor Convolutional Networks](https://github.com/jxgu1016/Gabor_CNN_PyTorch)
+[Gabor Convolutional Networks](https://github.com/jxgu1016/Gabor_CNN_PyTorch)   [PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn)   [nnAudio](https://github.com/KinWaiCheuk/nnAudio)
