@@ -10,7 +10,8 @@ The codebase is developed with `Python 3.7` `cuda 10.1`
 
 ## Gf+ model
 The visualization of general framework looks like:
-<div align="center"><img src="resources/General_framework.png"></div>
+
+<img src="resources/General_framework.png" height="300">
 
 ## Train PANNs from scratch
 
