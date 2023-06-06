@@ -14,7 +14,7 @@ The visualization of general framework looks like:
 <img src="resources/General_framework.png" height="350">
 
 
-## Train PANNs from scratch
+## Train models from scratch
 
 ### 1. Download dataset
 Please see [data/readme.md](./data/readme.md) for details of Email.
