@@ -26,9 +26,9 @@ The [utils/prepdata.py](utils/prepdata.py) script is used for packing all raw wa
 data
 └── DeepShip
      ├── class1
-     |    ├── fold1
+     |    ├── d1
      |    ├── ...
-     |    └── foldx
+     |    └── dx
      |        ├── 0001.wav
      |        ...
      |        └── 000x.wav
