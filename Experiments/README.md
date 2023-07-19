@@ -1,4 +1,4 @@
-Here we provide a couple experiments that we hope will help the interested reader understand the core idea of this repository. We recommend viewing the notebooks with [nbviewer](http://nbviewer.jupyter.org/), as it will be better rendered than on GitHub.
+Here we provide a couple experiments that we hope will help the interested reader understand the core idea of this repository. We recommend viewing the notebooks with [nbviewer](http://nbviewer.jupyter.org/), as figures will be better rendered than on GitHub.
 * [Preprocess and smooth](https://nbviewer.org/github/tan90xx/spectro-temporal-Gabor-features/blob/main/Experiments/a.Preprocess%20and%20smooth.ipynb)
 * [MVN and HEQ](https://nbviewer.org/github/tan90xx/spectro-temporal-Gabor-features/blob/main/Experiments/b.MVN%20and%20HEQ.ipynb)
 * [Mel and Gabor](https://nbviewer.org/github.com/tan90xx/spectro-temporal-Gabor-features/blob/main/Experiments/c.Mel%20and%20Gabor.ipynb)
