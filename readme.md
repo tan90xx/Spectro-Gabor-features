@@ -11,7 +11,7 @@ The codebase is developed with `Python 3.7` `cuda 10.1`
 ## Gf+ model
 The visualization of general framework looks like:
 
-<img src="resources/general_framework.png">
+<img src="resources/diagram.png">
 
 
 ## Train models from scratch
