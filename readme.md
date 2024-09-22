@@ -58,8 +58,13 @@ The CNN models are trained on a single card V100-SXM2-32GB. The training takes a
 
 Wandb have been used for experiments recording. Please check https://wandb.ai/pretty1sky/Features_try?workspace=user-pretty1sky.
 
-The variation of the mAP of CNN10 and Gf with the number of iterations under four different features before and after fine-tuning learnable parameter:
-<img src="resources/iter_on_feat.png">
+The variation of the mAP of CNN10 and Gf with the number of iterations under four different features before and after fine-tuning learnable parameter (left)
+and the Grad-CAM of CNN block (right) are shown below.
+
+<div style="text-align: center;">
+    <img src="resources/iter_on_feat.png" style="display: inline-block; width: 69%;">
+    <img src="resources/grad_cam.png" style="display: inline-block; width: 27%;">
+</div>
 
 ## Demos
 We apply the audio tagging system to build a sound event detection (SED) system.
