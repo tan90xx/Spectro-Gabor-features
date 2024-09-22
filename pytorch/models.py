@@ -4,8 +4,32 @@ import torch.nn.functional as F
 from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
-from pytorch_utils import do_mixup, interpolate, pad_framewise_output
- 
+from GaborLayer import GaborConv, GaborConvSca, GaborYu
+from gcn.layers import GConv
+
+from pytorch_utils import do_mixup, interpolate, pad_framewise_output, power_to_db, tpsw
+from nnAudio import features
+import numpy as np
+import pickle
+
+class PrecomputedNorm(nn.Module):
+    """Normalization using Pre-computed Mean/Std.
+    Args:
+        stats: Precomputed (mean, std).
+        axis: Axis setting used to calculate mean/variance.
+    """
+
+    def __init__(self, stats, axis=[1, 2]):
+        super().__init__()
+        self.axis = axis
+        self.mean, self.std = stats
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return ((X - self.mean) / self.std)
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + f'(mean={self.mean}, std={self.std}, axis={self.axis})'
+        return format_string
 
 def init_layer(layer):
     """Initialize a Linear or Convolutional layer. """
@@ -52,8 +76,11 @@ class ConvBlock(nn.Module):
     def forward(self, input, pool_size=(2, 2), pool_type='avg'):
         
         x = input
+        #print("1:",x.shape)
         x = F.relu_(self.bn1(self.conv1(x)))
+        #print("2:",x.shape)
         x = F.relu_(self.bn2(self.conv2(x)))
+        #print("3:",x.shape)
         if pool_type == 'max':
             x = F.max_pool2d(x, kernel_size=pool_size)
         elif pool_type == 'avg':
@@ -67,7 +94,54 @@ class ConvBlock(nn.Module):
         
         return x
 
+class GConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        
+        super(GConvBlock, self).__init__()
+        
+        self.gconv1 = GaborYu(in_channels=in_channels, 
+                              out_channels=out_channels,
+                              kernel_size=(3, 3), stride=(1, 1),
+                              padding=(1, 1), bias=False)
+                              
+        self.gconv2 = GaborYu(in_channels=out_channels, 
+                              out_channels=out_channels,
+                              kernel_size=(3, 3), stride=(1, 1),
+                              padding=(1, 1), bias=False)
+                              
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
 
+        self.init_weight()
+        
+    def init_weight(self):
+        init_layer(self.gconv1)
+        init_layer(self.gconv2)
+        init_bn(self.bn1)
+        init_bn(self.bn2)
+
+        
+    def forward(self, input, pool_size=(2, 2), pool_type='max'):
+        
+        x = input
+        x = self.gconv1(x)
+        #x = F.relu_(self.bn1(self.gconv1(x)))
+        #print("2:",x.shape)
+        #x = F.relu_(self.bn2(self.gconv2(x)))
+        #print("3:",x.shape)
+        if pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg':
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg+max':
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception('Incorrect argument!')
+        
+        return x
+ 
 class ConvBlock5x5(nn.Module):
     def __init__(self, in_channels, out_channels):
         
@@ -135,10 +209,19 @@ class AttBlock(nn.Module):
         elif self.activation == 'sigmoid':
             return torch.sigmoid(x)
 
+def normSpec(spec):
+    # take the logarithm of the values
+    ret = torch.log10(spec)
+    mean = torch.mean(ret)
+    std = torch.std(ret)
+    # Normalize each frame so its max 1, we dont need the extra dimension
+    #return (ret / torch.transpose(torch.max(ret,2)[0],0,1))[0]
+    #return (ret / torch.max(ret))[0]
+    return  ((ret - mean) / (std*4) + 0.5)[0]
 
 class Cnn14(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
-        fmax, classes_num):
+        fmax, classes_num, feature_name, learnable):
         
         super(Cnn14, self).__init__()
 
@@ -148,7 +231,7 @@ class Cnn14(nn.Module):
         ref = 1.0
         amin = 1e-10
         top_db = None
-
+        '''
         # Spectrogram extractor
         self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
             win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
@@ -158,6 +241,11 @@ class Cnn14(nn.Module):
         self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
             n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
+        '''
+        self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1, trainable_mel=False, 
+                                trainable_STFT=False, verbose=True)
 
         # Spec augmenter
         self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
@@ -184,12 +272,256 @@ class Cnn14(nn.Module):
  
     def forward(self, input, mixup_lambda=None):
         """
-        Input: (batch_size, data_length)"""
-
+        Input: (batch_size, data_length)
         x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-
+        
         x = x.transpose(1, 3)
+        """
+        # Using nnAudio 
+        x = self.spec_layer(input)
+        x = power_to_db(x) # x = (x + torch.finfo(torch.float).eps).log()
+        x = x.unsqueeze(3)
+           
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block5(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+  
+class Cnn14_nnAudio_gf(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name='log_stft'):
+        
+        super(Cnn14_nnAudio_gf, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+
+        # Using nnAudio
+        self.feature_name = feature_name
+        if feature_name=='log_mel' or 'mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=False, 
+                                    trainable_STFT=False, verbose=True)
+        elif feature_name=='log_spec' or 'spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude')
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1,
+                                    trainable_STFT=False, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=False, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Spec augmenter
+        #self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+        #    freq_drop_width=8, freq_stripes_num=2)
+
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+        
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+        self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
+        self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
+
+        self.fc1 = nn.Linear(2048, 2048, bias=True)
+        self.fc_audioset = nn.Linear(2048, classes_num, bias=True)
+        
+        self.init_weight()
+        self.max_pool = nn.MaxPool2d(8)
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+        # Using nnAudio 
+        x = self.spec_layer(input) # 16, 64, 1501 (num_samples, freq_bins,time_steps)
+        if 'log' in self.feature_name:
+            x = power_to_db(x) # x = (x + torch.finfo(torch.float).eps).log()
+        x = x.unsqueeze(3)     # 16, 64, 1501, 1
+        x = x.transpose(1, 3)  # 16, 1, 1501, 64
+        x = self.gconv1(x)     # 16, out_channels, 1501, 64
+        x = torch.mean(x,1)    # 16, 1501, 64
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        x = self.bn0(x)        # 16, 64, 1501, 1
+        x = x.transpose(1, 3) 
+        
+        
+        #if self.training:
+        #    x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block5(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn14_nnAudio(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name):
+        
+        super(Cnn14_nnAudio, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        # Using nnAudio
+        self.feature_name = feature_name
+        if feature_name=='log_mel' or 'mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=False, 
+                                    trainable_STFT=False, verbose=True)
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1,
+                                    trainable_STFT=False, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=False, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+        self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
+        self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
+
+        self.fc1 = nn.Linear(2048, 2048, bias=True)
+        self.fc_audioset = nn.Linear(2048, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+        # Using nnAudio 
+        x = self.spec_layer(input)
+        if 'log' in self.feature_name:
+            x = power_to_db(x) # x = (x + torch.finfo(torch.float).eps).log()
+        x = x.unsqueeze(3)
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        #x = x.transpose(1, 3)
+        
         x = self.bn0(x)
         x = x.transpose(1, 3)
         
@@ -226,6 +558,107 @@ class Cnn14(nn.Module):
 
         return output_dict
 
+class Cnn14_nnAudio_norm(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num):
+        
+        super(Cnn14_nnAudio_norm, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        # Using nnAudio
+        self.spec_layer = features.MelSpectrogram(sr=32000, n_fft=window_size, win_length=window_size, 
+                                n_mels=mel_bins, hop_length=hop_size, window='hann', center=True, pad_mode=pad_mode, 
+                                power=2.0, htk=False, fmin=fmin, fmax=fmax, norm=1, trainable_mel=False, 
+                                trainable_STFT=False, verbose=True)
+        
+        self.normalizer = PrecomputedNorm(stats = [-9.660292, 4.7219563])
+
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+        self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
+        self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
+
+        self.fc1 = nn.Linear(2048, 2048, bias=True)
+        self.fc_audioset = nn.Linear(2048, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+        # Using nnAudio 
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = self.normalizer(x)
+        x = x.unsqueeze(3)
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        #x = x.transpose(1, 3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block5(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
 
 class Cnn14_no_specaug(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
@@ -284,7 +717,7 @@ class Cnn14_no_specaug(nn.Module):
         if self.training and mixup_lambda is not None:
             x = do_mixup(x, mixup_lambda)
         
-        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='max')
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
         x = F.dropout(x, p=0.2, training=self.training)
@@ -309,7 +742,6 @@ class Cnn14_no_specaug(nn.Module):
         output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
 
         return output_dict
-
 
 class Cnn14_no_dropout(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
@@ -398,9 +830,655 @@ class Cnn14_no_dropout(nn.Module):
 
 class Cnn6(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
-        fmax, classes_num):
+        fmax, classes_num, feature_name, learnable):
         
         super(Cnn6, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                        n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                        power=2.0, htk=False, norm=1, trainable_mel=False, 
+                        trainable_STFT=False, verbose=True)
+
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock5x5(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock5x5(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock5x5(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock5x5(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x) # x = (x + torch.finfo(torch.float).eps).log()
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+  
+class Cnn10_gf_no_specaug(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_gf_no_specaug, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        trainable_STFT=False
+        trainable_mel=False
+        trainable_gabor=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        elif 'gabor' in learnable:
+            trainable_gabor=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, norm=1, trainable_gammatone=trainable_gammatone,
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+        if trainable_gabor:
+            self.gconv1 = GConv(1, channel, 3, padding=1, stride=1, M=4, nScale=1, bias=False, expand=True)
+        
+
+        self.bn0 = nn.BatchNorm2d(n)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        x = torch.mean(x, 1)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn10_gf(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_gf, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        trainable_STFT=False
+        trainable_mel=False
+        trainable_gabor=False
+        trainable_gammatone=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        elif 'gabor' in learnable:
+            trainable_gabor=True
+        elif 'gammatone' in learnable:
+            trainable_gammatone=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, norm=1,trainable_bins=trainable_gammatone, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+        if trainable_gabor:
+            self.gconv1 = GConv(1, channel, 3, padding=1, stride=1, M=4, nScale=1, bias=False, expand=True)
+        
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(n)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        x = torch.mean(x, 1)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        #if self.training:
+        #    x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn10_gf_DecisionLevelMax(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_gf_DecisionLevelMax, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        trainable_STFT=False
+        trainable_mel=False
+        trainable_gabor=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        elif 'gabor' in learnable:
+            trainable_gabor=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1,
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+        if trainable_gabor:
+            self.gconv1 = GConv(1, channel, 3, padding=1, stride=1, M=4, nScale=1, bias=False, expand=True)
+        
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(n)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        self.interpolate_ratio = 16
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        frames_num = x.shape[2]
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        x = torch.mean(x, 1)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x_test = x1 + x2
+        x_test = F.dropout(x_test, p=0.5, training=self.training)
+        x_test = F.relu_(self.fc1(x_test))
+        embedding = F.dropout(x_test, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x_test))
+        
+        x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = x.transpose(1, 2)
+        x = F.relu_(self.fc1(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        segmentwise_output = torch.sigmoid(self.fc_audioset(x))
+
+        # Get framewise output
+        framewise_output = interpolate(segmentwise_output, self.interpolate_ratio)
+        framewise_output = pad_framewise_output(framewise_output, frames_num)
+
+        output_dict = {'framewise_output': framewise_output, 
+            'clipwise_output': clipwise_output}
+
+        return output_dict
+    
+class Cnn10_gf_4look(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_gf_4look, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        trainable_STFT=False
+        trainable_mel=False
+        trainable_gabor=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        elif 'gabor' in learnable:
+            trainable_gabor=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1,
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+        if trainable_gabor:
+            self.gconv1 = GConv(1, channel, 3, padding=1, stride=1, M=4, nScale=1, bias=False, expand=True)
+        
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(n)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+        outputs = []
+        
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        outputs.append(x)
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        outputs.append(x)
+        
+        x = torch.mean(x, 1)
+        outputs.append(x)
+        
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return outputs
+    
+class Cnn10_origin(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num):
+        
+        super(Cnn10_origin, self).__init__()
 
         window = 'hann'
         center = True
@@ -425,10 +1503,10 @@ class Cnn6(nn.Module):
 
         self.bn0 = nn.BatchNorm2d(64)
 
-        self.conv_block1 = ConvBlock5x5(in_channels=1, out_channels=64)
-        self.conv_block2 = ConvBlock5x5(in_channels=64, out_channels=128)
-        self.conv_block3 = ConvBlock5x5(in_channels=128, out_channels=256)
-        self.conv_block4 = ConvBlock5x5(in_channels=256, out_channels=512)
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
 
         self.fc1 = nn.Linear(512, 512, bias=True)
         self.fc_audioset = nn.Linear(512, classes_num, bias=True)
@@ -439,6 +1517,8 @@ class Cnn6(nn.Module):
         init_bn(self.bn0)
         init_layer(self.fc1)
         init_layer(self.fc_audioset)
+
+
  
     def forward(self, input, mixup_lambda=None):
         """
@@ -479,13 +1559,286 @@ class Cnn6(nn.Module):
         output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
 
         return output_dict
-
-
-class Cnn10(nn.Module):
+    
+class Transfer_Cnn10_gf(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
-        fmax, classes_num):
+        fmax, classes_num, feature_name='mel', learnable='none', freeze_base=False):
         
-        super(Cnn10, self).__init__()
+        super(Transfer_Cnn10_gf, self).__init__()
+        audioset_classes_num = 527
+        
+        self.base = Cnn10_origin(sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, audioset_classes_num)
+
+        if freeze_base:
+            # Freeze AudioSet pretrained layers
+            for param in self.base.parameters():
+                param.requires_grad = False
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        trainable_STFT=False
+        trainable_mel=False
+        trainable_gabor=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        elif 'gabor' in learnable:
+            trainable_gabor=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1,
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+        if trainable_gabor:
+            self.gconv1 = GConv(1, channel, 3, padding=1, stride=1, M=4, nScale=1, bias=False, expand=True)
+        
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(n)
+        
+        self.conv_block1 = self.base.conv_block1
+        self.conv_block2 = self.base.conv_block2
+        self.conv_block3 = self.base.conv_block3
+        self.conv_block4 = self.base.conv_block4
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+
+        self.init_weight()
+
+    def load_from_pretrain(self, pretrained_checkpoint_path):
+        checkpoint = torch.load(pretrained_checkpoint_path)
+        self.base.load_state_dict(checkpoint['model'])
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        x = torch.mean(x, 1)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Transfer_Cnn10(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable, freeze_base=False):
+        """Classifier for a new task using pretrained Cnn14 as a sub module.
+        """
+        super(Transfer_Cnn10, self).__init__()
+        audioset_classes_num = 527
+        
+        self.base = Cnn10(sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable)
+
+        # Transfer to another task layer
+        self.fc_transfer = nn.Linear(512, classes_num, bias=True)
+
+        if freeze_base:
+            # Freeze AudioSet pretrained layers
+            for param in self.base.parameters():
+                param.requires_grad = False
+
+        self.init_weights()
+
+    def init_weights(self):
+        init_layer(self.fc_transfer)
+
+    def load_from_pretrain(self, pretrained_checkpoint_path):
+        checkpoint = torch.load(pretrained_checkpoint_path)
+        self.base.load_state_dict(checkpoint['model'])
+
+    def forward(self, input, mixup_lambda=None):
+        """Input: (batch_size, data_length)
+        """
+        output_dict = self.base(input, mixup_lambda)
+        embedding = output_dict['embedding']
+
+        clipwise_output =  torch.softmax(self.fc_transfer(embedding), dim=-1)
+        output_dict['clipwise_output'] = clipwise_output
+ 
+        return output_dict
+    
+class Cnn10_lofar_demon(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_lofar_demon, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        
+        trainable_gabor=False
+        if 'gabor' in learnable:
+            trainable_gabor=True
+        
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+
+        if trainable_gabor:
+            self.gconv1 = GConv(1, channel, 3, padding=1, stride=1, M=4, nScale=1, bias=False, expand=True)
+            
+        # Using nnAudio
+        self.bn0 = nn.BatchNorm2d(410)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+
+    def apply_on_spectrogram(self, spec):
+        return tpsw(spec)
+    
+    def apply_along_axis(self, function, x, axis: int = 0):
+        return torch.stack([function(x_i) for x_i in torch.unbind(x, dim=axis)], dim=axis)
+
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)
+        """
+
+        x = input
+        x = power_to_db(x) # 16, 410, 61
+        x = x.unsqueeze(3) # 16, 410, 61, 1
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        x = torch.mean(x, 1)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn10_fusion(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_fusion, self).__init__()
 
         window = 'hann'
         center = True
@@ -494,19 +1847,130 @@ class Cnn10(nn.Module):
         amin = 1e-10
         top_db = None
 
-        # Spectrogram extractor
-        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
-            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
-            freeze_parameters=True)
+        trainable_STFT=False
+        trainable_mel=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        # Using nnAudio
 
-        # Logmel feature extractor
-        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
-            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
-            freeze_parameters=True)
+        self.spec_layer1 = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                trainable_STFT=trainable_STFT, verbose=True)
 
-        # Spec augmenter
-        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
-            freq_drop_width=8, freq_stripes_num=2)
+        self.spec_layer2 = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1,
+                                trainable_STFT=trainable_STFT, verbose=True)
+        
+        self.spec_layer3 = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                trainable=trainable_STFT, verbose=True)
+        
+        self.spec_layer4 = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+
+        self.bn0 = nn.BatchNorm2d(128)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)
+        """
+
+        x1 = self.spec_layer2(input)
+        x1 = power_to_db(x1) # 16, 64, 1501
+        x1 = x1.unsqueeze(3) # 16, 64, 1501, 1
+        #x1 = x1[:,32:,:,:]
+        
+        x2 = self.spec_layer4(input)
+        x2 = power_to_db(x2)
+        x2 = x2.unsqueeze(3)
+        #x2 = x2[:,32:,:,:]
+        
+        x = torch.stack((x1, x2),-1)
+        x = x.view(-1, 128, 1501, 1)
+        x = self.bn0(x)
+        
+        x = x.transpose(1, 3)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn10_fusion_hf(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_fusion_hf, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        trainable_STFT=False
+        trainable_mel=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        # Using nnAudio
+
+        self.spec_layer1 = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                trainable_STFT=trainable_STFT, verbose=True)
+
+        self.spec_layer2 = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1,
+                                trainable_STFT=trainable_STFT, verbose=True)
+        
+        self.spec_layer3 = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                trainable=trainable_STFT, verbose=True)
+        
+        self.spec_layer4 = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
 
         self.bn0 = nn.BatchNorm2d(64)
 
@@ -527,12 +1991,469 @@ class Cnn10(nn.Module):
  
     def forward(self, input, mixup_lambda=None):
         """
-        Input: (batch_size, data_length)"""
+        Input: (batch_size, data_length)
+        """
 
-        x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        x1 = self.spec_layer3(input)
+        x1 = power_to_db(x1) # 16, 64, 1501
+        x1 = x1.unsqueeze(3) # 16, 64, 1501, 1
+        x1 = x1[:,32:,:,:]
+        
+        x2 = self.spec_layer4(input)
+        x2 = power_to_db(x2)
+        x2 = x2.unsqueeze(3)
+        x2 = x2[:,32:,:,:]
+        
+        x = torch.stack((x1, x2),-1)
+        x = x.view(-1, 64, 1501, 1)
+        x = self.bn0(x)
         
         x = x.transpose(1, 3)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+
+class Cnn10_fusion_lf(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_fusion_lf, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        trainable_STFT=False
+        trainable_mel=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        # Using nnAudio
+
+        self.spec_layer1 = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                trainable_STFT=trainable_STFT, verbose=True)
+
+        self.spec_layer2 = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1,
+                                trainable_STFT=trainable_STFT, verbose=True)
+        
+        self.spec_layer3 = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                trainable=trainable_STFT, verbose=True)
+        
+        self.spec_layer4 = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)
+        """
+
+        x1 = self.spec_layer2(input)
+        x1 = power_to_db(x1) # 16, 64, 1501
+        x1 = x1.unsqueeze(3) # 16, 64, 1501, 1
+        x1 = x1[:,:32,:,:]
+        
+        x2 = self.spec_layer4(input)
+        x2 = power_to_db(x2)
+        x2 = x2.unsqueeze(3)
+        x2 = x2[:,:32,:,:]
+        
+        x = torch.stack((x1, x2),-1)
+        x = x.view(-1, 64, 1501, 1)
+        x = self.bn0(x)
+        
+        x = x.transpose(1, 3)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn10_fusion_gf(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_fusion_gf, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        trainable_STFT=False
+        trainable_mel=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+            
+        # Using nnAudio
+
+        self.spec_layer1 = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                trainable_STFT=trainable_STFT, verbose=True)
+
+        self.spec_layer2 = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                power=2.0, htk=False, norm=1,
+                                trainable_STFT=trainable_STFT, verbose=True)
+
+        self.spec_layer3 = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                trainable=trainable_STFT, verbose=True)
+        
+        self.spec_layer4 = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+        
+        # Gabor layer
+        channel=8
+        self.gconv1 = GaborYu(in_channels=1, 
+                      out_channels=channel,
+                      kernel_size=(3, 3), stride=(1, 1),
+                      padding=(1, 1), bias=False)
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)
+        """
+
+        x1 = self.spec_layer2(input)
+        x1 = power_to_db(x1) # 16, 64, 1501
+        x1 = x1.unsqueeze(3) # 16, 64, 1501, 1
+        x1 = x1[:,:32,:,:]
+        
+        x2 = self.spec_layer3(input)
+        x2 = power_to_db(x2)
+        x2 = x2.unsqueeze(3)
+        x2 = x2[:,:32,:,:]
+        
+        x = torch.stack((x1, x2),-1)
+        x = x.view(-1, 64, 1501, 1)
+        
+        x = x.transpose(1, 3)
+        x = self.gconv1(x)
+        x = torch.mean(x, 1)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        
+        x = x.transpose(1, 3)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+
+class Cnn10(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+
+        trainable_STFT=False
+        trainable_mel=False
+        trainable_gammatone=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        elif 'gammatone' in learnable:
+            trainable_gammatone=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, norm=1, trainable_bins=trainable_gammatone,
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(n)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+        
+        
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        if self.training:
+            x = self.spec_augmenter(x)
+
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        x = x1 + x2
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        embedding = F.dropout(x, p=0.5, training=self.training)
+        clipwise_output = torch.sigmoid(self.fc_audioset(x))
+        
+        output_dict = {'clipwise_output': clipwise_output, 'embedding': embedding}
+
+        return output_dict
+    
+class Cnn10_no_specaug(nn.Module):
+    def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
+        fmax, classes_num, feature_name, learnable):
+        
+        super(Cnn10_no_specaug, self).__init__()
+
+        window = 'hann'
+        center = True
+        pad_mode = 'reflect'
+        ref = 1.0
+        amin = 1e-10
+        top_db = None
+        '''
+        # Spectrogram extractor
+        self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
+            win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
+            freeze_parameters=True)
+
+        # Logmel feature extractor
+        self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
+            n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
+            freeze_parameters=True)
+        '''
+        trainable_STFT=False
+        trainable_mel=False
+        if 'stft' in learnable:
+            trainable_STFT=True
+        elif 'mel' in learnable:
+            trainable_mel=True
+        # Using nnAudio
+        self.feature_name = feature_name
+        n = 64
+        if feature_name=='mel':
+            self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1, trainable_mel=trainable_mel, 
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='spec':
+            self.spec_layer = features.stft.STFT(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                                    hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, output_format='Magnitude',
+                                    trainable=trainable_STFT, verbose=True)
+            n = 513
+        elif feature_name=='gammatone':
+            self.spec_layer = features.Gammatonegram(sr=sample_rate, n_fft=window_size, fmin=fmin, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    power=2.0, htk=False, norm=1,
+                                    trainable_STFT=trainable_STFT, verbose=True)
+        elif feature_name=='cqt':
+            self.spec_layer = features.cqt.CQT(sr=sample_rate, fmin=10, fmax=fmax, 
+                                    n_bins=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                                    trainable=trainable_STFT, verbose=True)
+        elif feature_name=='mfcc':
+            self.spec_layer = features.mel.MFCC(sr=sample_rate, n_mfcc=mel_bins)
+            
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(n)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+        init_layer(self.fc_audioset)
+ 
+    def forward(self, input, mixup_lambda=None):
+        """
+        Input: (batch_size, data_length)"""
+
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
         x = self.bn0(x)
         x = x.transpose(1, 3)
         
@@ -770,7 +2691,7 @@ class _ResNet(nn.Module):
 
 class ResNet22(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
-        fmax, classes_num):
+        fmax, classes_num, feature_name, learnable):
         
         super(ResNet22, self).__init__()
 
@@ -780,7 +2701,7 @@ class ResNet22(nn.Module):
         ref = 1.0
         amin = 1e-10
         top_db = None
-
+        '''
         # Spectrogram extractor
         self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
             win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
@@ -790,7 +2711,12 @@ class ResNet22(nn.Module):
         self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
             n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
-
+        '''
+        self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                power=2.0, htk=False, norm=1, trainable_mel=False, 
+                trainable_STFT=False, verbose=True)
+        
         # Spec augmenter
         self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
             freq_drop_width=8, freq_stripes_num=2)
@@ -819,10 +2745,14 @@ class ResNet22(nn.Module):
         """
         Input: (batch_size, data_length)"""
 
-        x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
+        #x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+        #x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
         
-        x = x.transpose(1, 3)
+        #x = x.transpose(1, 3)
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
         x = self.bn0(x)
         x = x.transpose(1, 3)
         
@@ -857,7 +2787,7 @@ class ResNet22(nn.Module):
 
 class ResNet38(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
-        fmax, classes_num):
+        fmax, classes_num, feature_name, learnable):
         
         super(ResNet38, self).__init__()
 
@@ -867,17 +2797,22 @@ class ResNet38(nn.Module):
         ref = 1.0
         amin = 1e-10
         top_db = None
-
+        '''
         # Spectrogram extractor
         self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
             win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
             freeze_parameters=True)
-
+        
         # Logmel feature extractor
         self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
             n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
-
+        '''
+        self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                power=2.0, htk=False, norm=1, trainable_mel=False, 
+                trainable_STFT=False, verbose=True)
+        
         # Spec augmenter
         self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
             freq_drop_width=8, freq_stripes_num=2)
@@ -904,12 +2839,17 @@ class ResNet38(nn.Module):
 
     def forward(self, input, mixup_lambda=None):
         """
-        Input: (batch_size, data_length)"""
+        Input: (batch_size, data_length)
 
         x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
         
         x = x.transpose(1, 3)
+        """
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
         x = self.bn0(x)
         x = x.transpose(1, 3)
         
@@ -944,7 +2884,7 @@ class ResNet38(nn.Module):
 
 class ResNet54(nn.Module):
     def __init__(self, sample_rate, window_size, hop_size, mel_bins, fmin, 
-        fmax, classes_num):
+        fmax, classes_num, feature_name, learnable):
         
         super(ResNet54, self).__init__()
 
@@ -954,7 +2894,7 @@ class ResNet54(nn.Module):
         ref = 1.0
         amin = 1e-10
         top_db = None
-
+        '''
         # Spectrogram extractor
         self.spectrogram_extractor = Spectrogram(n_fft=window_size, hop_length=hop_size, 
             win_length=window_size, window=window, center=center, pad_mode=pad_mode, 
@@ -964,7 +2904,12 @@ class ResNet54(nn.Module):
         self.logmel_extractor = LogmelFilterBank(sr=sample_rate, n_fft=window_size, 
             n_mels=mel_bins, fmin=fmin, fmax=fmax, ref=ref, amin=amin, top_db=top_db, 
             freeze_parameters=True)
-
+        '''
+        self.spec_layer = features.MelSpectrogram(sr=sample_rate, n_fft=window_size, win_length=window_size, fmin=fmin, fmax=fmax,
+                n_mels=mel_bins, hop_length=hop_size, window=window, center=center, pad_mode=pad_mode, 
+                power=2.0, htk=False, norm=1, trainable_mel=False, 
+                trainable_STFT=False, verbose=True)
+        
         # Spec augmenter
         self.spec_augmenter = SpecAugmentation(time_drop_width=64, time_stripes_num=2, 
             freq_drop_width=8, freq_stripes_num=2)
@@ -991,12 +2936,17 @@ class ResNet54(nn.Module):
 
     def forward(self, input, mixup_lambda=None):
         """
-        Input: (batch_size, data_length)"""
+        Input: (batch_size, data_length)
 
         x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
         
         x = x.transpose(1, 3)
+        """
+        x = self.spec_layer(input)
+        x = power_to_db(x)
+        x = x.unsqueeze(3)
+        
         x = self.bn0(x)
         x = x.transpose(1, 3)
         

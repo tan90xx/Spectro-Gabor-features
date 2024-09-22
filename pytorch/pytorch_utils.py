@@ -2,6 +2,90 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
+from scipy.signal import cheb2ord, cheby2, convolve, decimate, hilbert, lfilter, spectrogram
+
+def apply_along_axis(function, x, axis: int = 0):
+    return torch.stack([function(x_i) for x_i in torch.unbind(x, dim=axis)], dim=axis)
+#################################### demon and lofar ↓ ##########################################
+import torch
+import torch.nn.functional as F
+
+def tpsw(signal, npts=None, n=None, p=None, a=None):
+    x = signal.clone().detach().requires_grad_(False) # 513, 1501
+    if npts is None:
+        npts = x.shape[0]
+    if n is None:
+        n = int(round(npts*.04/2.0+1))
+    if p is None:
+        p = int(round(n / 8.0 + 1))
+    if a is None:
+        a = 2.0
+    if p > 0:
+        h = torch.cat((torch.ones((n-p+1)), torch.zeros(2 * p-1), torch.ones((n-p+1))))
+    else:
+        h = torch.ones((1, 2*n+1))
+        p = 1
+    h /= torch.norm(h, p=1)
+    
+    def apply_on_spectre(xs):
+        # Create convolutional layer with appropriate padding and stride
+        conv_layer = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=h.shape[0], padding=h.shape[0]-1, stride=1)
+        conv_layer.to('cuda')
+        # Set weights of convolutional layer to filter coefficients
+        with torch.no_grad():
+            conv_layer.weight[:] = h.reshape(1, 1, -1)
+
+        # Apply convolution to input tensor
+        #xs = xs.permute(1, 0)  # PyTorch expects dimensions to be [batch_size, input_dim, sequence_length]
+        xs = xs.view(1,1,-1)
+        out = conv_layer(xs).squeeze()  # Add batch dimension and remove it after convolution
+
+        # Return output tensor with appropriate dimensions
+        return out # Undo permutation to match original dimensions
+    mx = apply_along_axis(apply_on_spectre, x, axis=1) # 513, 1501
+    ix = int(np.floor((h.shape[0] + 1)/2.0))  # 滤波器滞后
+    mx = mx[ix-1:npts+ix-1]  # 校正滞后 # 502, 1501
+    # 修正光谱的极值点
+    ixp = ix - p
+    mult = (2 * ixp / torch.cat((torch.ones(p - 1) * ixp, torch.arange(ixp, 2 * ixp + 1)), dim=0)[:, None]).to('cuda')  # 极值点校正 12, 1
+    temp = torch.ones((1, x.shape[1])).to('cuda') # 1, 1501
+    mx[:ix, :] = mx[:ix, :]*(mult @ temp)  # 起始点
+    ###################################################################################
+    test = mx[npts-ix:npts, :]
+    mx[npts-ix:npts, :] = mx[npts-ix:npts, :]*(torch.flipud(mult) @ temp)  # Pontos finais
+    # 消除第二步过滤的峰值
+    # indl= torch.where((x-a*mx) > 0) # 点大于a*mx
+    indl = (x-a*mx) > 0
+    #x[indl] = mx[indl]
+    x = torch.where(indl, mx, x)
+    mx = apply_along_axis(apply_on_spectre, x, axis=1)
+    mx = mx[ix-1:npts+ix-1, :]
+    # 修正光谱的极值点
+    mx[:ix, :] = mx[:ix, :]*(mult @ temp)  # 起始点
+    mx[npts-ix:npts, :] = mx[npts-ix:npts, :]*(torch.flipud(mult) @ temp)  # Pontos finais
+
+    if signal.ndim == 1:
+        mx = mx[:, 0]
+    return mx.clone().detach().requires_grad_(False)
+#################################### demon and lofar ↑ ##########################################
+
+def power_to_db(input):
+    r"""Power to db, this function is the pytorch implementation of 
+    librosa.power_to_lb
+    """
+    ref_value = 1.0
+    amin = 1e-10
+    top_db = 80.0
+
+    log_spec = 10.0 * torch.log10(torch.clamp(input, min=amin, max=np.inf))
+    log_spec -= 10.0 * np.log10(np.maximum(amin, ref_value))
+
+    if top_db is not None:
+        if top_db < 0:
+            raise librosa.util.exceptions.ParameterError('top_db must be non-negative')
+        log_spec = torch.clamp(log_spec, min=log_spec.max().item() - top_db, max=np.inf)
+
+    return log_spec
 
 
 def move_data_to_device(x, device):

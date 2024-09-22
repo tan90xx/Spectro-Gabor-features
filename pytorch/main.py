@@ -11,16 +11,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.data
  
 from config import (sample_rate, classes_num, mel_bins, fmin, fmax, window_size, 
     hop_size, window, pad_mode, center, ref, amin, top_db)
 from losses import get_loss_func
-from pytorch_utils import move_data_to_device, do_mixup
+from pytorch_utils import move_data_to_device, do_mixup, count_parameters
 from utilities import (create_folder, get_filename, create_logging, StatisticsContainer, Mixup)
 from data_generator import Dataset, TrainSampler, EvaluateSampler, collate_fn
-from models import Cnn14
+#from models import Cnn14, Cnn14_nnAudio, Cnn14_nnAudio_gf, Cnn14_nnAudio_norm, Cnn6, Cnn10, Cnn10_fusion, Cnn10_no_specaug, Cnn10_gf, Cnn10_gf_no_specaug, Transfer_Cnn10, Cnn10_origin, ResNet22, ResNet38, ResNet54
+#from model import Cnn10, ResNet54, Cnn14, Cnn10_fusion, Cnn10_fusion_hf, Cnn10_fusion_lf, Cnn10_fusion_gf, Cnn10_lofar_demon, #Cnn10_gf_no_specaug, Cnn10_origin, Transfer_Cnn10, Transfer_Cnn10_gf, Cnn10_gf_DecisionLevelMax, Cnn10_gf
+from models import Cnn6, Cnn10, Cnn14, ResNet22, ResNet38, ResNet54, Cnn10_gf
 from evaluate import Evaluator
 
+import wandb
 
 def train(args):
 
@@ -30,6 +34,7 @@ def train(args):
     model_type = args.model_type
     pretrained_checkpoint_path = args.pretrained_checkpoint_path
     freeze_base = args.freeze_base
+    set_indexes = args.set_indexes
     loss_type = args.loss_type
     augmentation = args.augmentation
     learning_rate = args.learning_rate
@@ -39,29 +44,33 @@ def train(args):
     device = 'cuda' if (args.cuda and torch.cuda.is_available()) else 'cpu'
     filename = args.filename
     num_workers = 8
+    use_wandb = False if args.wandb=='none' else args.wandb
+    feature_name = args.feature_name
+    learnable = args.learnable
 
     loss_func = get_loss_func(loss_type)
     pretrain = True if pretrained_checkpoint_path else False
     
-    hdf5_path = os.path.join(workspace, 'data', 'waveform.h5')
+    #hdf5_path = os.path.join(workspace, 'data', 'waveform.h5')
+    hdf5_path = args.hdf5_path
 
     checkpoints_dir = os.path.join(workspace, 'checkpoints', filename, 
-        'holdout_fold={}'.format(holdout_fold), model_type, 'pretrain={}'.format(pretrain), 
-        'loss_type={}'.format(loss_type), 'augmentation={}'.format(augmentation),
-         'batch_size={}'.format(batch_size), 'freeze_base={}'.format(freeze_base))
+        'holdout_fold={}'.format(holdout_fold), model_type, 'feature={}'.format(feature_name), 
+        'learnable={}'.format(learnable), 
+         'batch_size={}'.format(batch_size))
     create_folder(checkpoints_dir)
 
     statistics_path = os.path.join(workspace, 'statistics', filename, 
-        'holdout_fold={}'.format(holdout_fold), model_type, 'pretrain={}'.format(pretrain), 
-        'loss_type={}'.format(loss_type), 'augmentation={}'.format(augmentation), 
-        'batch_size={}'.format(batch_size), 'freeze_base={}'.format(freeze_base), 
+        'holdout_fold={}'.format(holdout_fold), model_type, 'feature={}'.format(feature_name), 
+        'learnable={}'.format(learnable), 
+        'batch_size={}'.format(batch_size), 
         'statistics.pickle')
     create_folder(os.path.dirname(statistics_path))
     
     logs_dir = os.path.join(workspace, 'logs', filename, 
-        'holdout_fold={}'.format(holdout_fold), model_type, 'pretrain={}'.format(pretrain), 
-        'loss_type={}'.format(loss_type), 'augmentation={}'.format(augmentation), 
-        'batch_size={}'.format(batch_size), 'freeze_base={}'.format(freeze_base))
+        'holdout_fold={}'.format(holdout_fold), model_type, 'feature={}'.format(feature_name), 
+        'learnable={}'.format(learnable), 
+        'batch_size={}'.format(batch_size))
     create_logging(logs_dir, 'w')
     logging.info(args)
 
@@ -70,10 +79,26 @@ def train(args):
     else:
         logging.info('Using CPU. Set --cuda flag to use GPU.')
     
+    # wandb
+    if use_wandb:
+        default_config = dict(
+            model_type = model_type,
+            holdout_fold = holdout_fold,
+            batch_size = batch_size,
+            loss_type = loss_type
+        )
+
+        wandb.init(project=args.wandb, config=args)
+        #wandb.init(dir='/root/autodl-fs/non-synced')
+    
+    
     # Model
     Model = eval(model_type)
-    model = Model(sample_rate, window_size, hop_size, mel_bins, fmin, fmax, classes_num)
-
+    model = Model(sample_rate, window_size, hop_size, mel_bins, fmin, fmax, classes_num, feature_name, learnable)
+    
+    params_num = count_parameters(model)
+    logging.info('Parameters num: {}'.format(params_num))
+    
     # Statistics
     statistics_container = StatisticsContainer(statistics_path)
 
@@ -101,12 +126,14 @@ def train(args):
     train_sampler = TrainSampler(
         hdf5_path=hdf5_path, 
         holdout_fold=holdout_fold, 
-        batch_size=batch_size * 2 if 'mixup' in augmentation else batch_size)
+        batch_size=batch_size * 2 if 'mixup' in augmentation else batch_size,
+        set_indexes=set_indexes)
 
     validate_sampler = EvaluateSampler(
         hdf5_path=hdf5_path, 
         holdout_fold=holdout_fold, 
-        batch_size=batch_size)
+        batch_size=batch_size,
+        set_indexes=set_indexes)
 
     # Data loader
     train_loader = torch.utils.data.DataLoader(dataset=dataset, 
@@ -140,29 +167,39 @@ def train(args):
         # asdf
         
         # Evaluate
-        if iteration % 200 == 0 and iteration > 0:
-            if resume_iteration > 0 and iteration == resume_iteration:
-                pass
-            else:
-                logging.info('------------------------------------')
-                logging.info('Iteration: {}'.format(iteration))
+        if iteration % 200 == 0:
+            #if resume_iteration > 0 and iteration == resume_iteration:
+            #    pass
+            #else:
+            logging.info('------------------------------------')
+            logging.info('Iteration: {}'.format(iteration))
 
-                train_fin_time = time.time()
+            train_fin_time = time.time()
 
-                statistics = evaluator.evaluate(validate_loader)
-                logging.info('Validate accuracy: {:.3f}'.format(statistics['accuracy']))
+            statistics = evaluator.evaluate(validate_loader)
+            print(statistics)
+            logging.info('Validate accuracy: {:.3f}'.format(np.mean(statistics['average_precision'])))
 
-                statistics_container.append(iteration, statistics, 'validate')
-                statistics_container.dump()
+            statistics_container.append(iteration, statistics, 'validate')
+            statistics_container.dump()
+            if use_wandb:
+                wandb.log({'Validate accuracy':np.mean(statistics['average_precision'])})#,'auc':np.mean(statistics['auc'])})#,
+                           #'1-AP':statistics['average_precision'][0],'1-auc':statistics['auc'][0],
+                           #'2-AP':statistics['average_precision'][1],'2-auc':statistics['auc'][1],
+                           #'3-AP':statistics['average_precision'][2],'3-auc':statistics['auc'][2],
+                           #'4-AP':statistics['average_precision'][3],'4-auc':statistics['auc'][3]})
 
-                train_time = train_fin_time - train_bgn_time
-                validate_time = time.time() - train_fin_time
+            train_time = train_fin_time - train_bgn_time
+            validate_time = time.time() - train_fin_time
 
-                logging.info(
-                    'Train time: {:.3f} s, validate time: {:.3f} s'
-                    ''.format(train_time, validate_time))
+            logging.info(
+                'Train time: {:.3f} s, validate time: {:.3f} s'
+                ''.format(train_time, validate_time))
 
-                train_bgn_time = time.time()
+            train_bgn_time = time.time()
+            
+            del statistics
+            torch.cuda.empty_cache()
 
         # Save model 
         if iteration % 2000 == 0 and iteration > 0:
@@ -203,7 +240,9 @@ def train(args):
 
         # loss
         loss = loss_func(batch_output_dict, batch_target_dict)
-        print(iteration, loss)
+        # print(iteration, loss)
+        if use_wandb:
+            wandb.log({'loss':loss})
 
         # Backward
         optimizer.zero_grad()
@@ -224,10 +263,13 @@ if __name__ == '__main__':
     # Train
     parser_train = subparsers.add_parser('train')
     parser_train.add_argument('--workspace', type=str, required=True, help='Directory of your workspace.')
+    parser_train.add_argument('--hdf5_path', type=str, required=True)
     parser_train.add_argument('--holdout_fold', type=str, choices=['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'], required=True)
+    parser_train.add_argument('--feature_name', type=str, required=True)
     parser_train.add_argument('--model_type', type=str, required=True)
     parser_train.add_argument('--pretrained_checkpoint_path', type=str)
     parser_train.add_argument('--freeze_base', action='store_true', default=False)
+    parser_train.add_argument('--set_indexes', action='store_true', default=False)
     parser_train.add_argument('--loss_type', type=str, required=True)
     parser_train.add_argument('--augmentation', type=str, choices=['none', 'mixup'], required=True)
     parser_train.add_argument('--learning_rate', type=float, required=True)
@@ -235,6 +277,8 @@ if __name__ == '__main__':
     parser_train.add_argument('--resume_iteration', type=int)
     parser_train.add_argument('--stop_iteration', type=int, required=True)
     parser_train.add_argument('--cuda', action='store_true', default=False)
+    parser_train.add_argument('--wandb', type=str, required=True)
+    parser_train.add_argument('--learnable', type=str, required=True)
 
     # Parse arguments
     args = parser.parse_args()
@@ -242,6 +286,10 @@ if __name__ == '__main__':
 
     if args.mode == 'train':
         train(args)
-
+        if args.wandb:
+            wandb.finish()
     else:
         raise Exception('Error argument!')
+    
+    for _ in range(5):
+        torch.cuda.empty_cache()

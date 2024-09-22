@@ -2,6 +2,12 @@ from sklearn import metrics
 
 from pytorch_utils import forward
 
+import numpy as np
+
+def calculate_accuracy(y_true, y_score):
+    N = y_true.shape[0]
+    accuracy = np.sum(np.argmax(y_true, axis=-1) == np.argmax(y_score, axis=-1)) / N
+    return accuracy
 
 class Evaluator(object):
     def __init__(self, model):
@@ -35,8 +41,10 @@ class Evaluator(object):
         average_precision = metrics.average_precision_score(
             target, clipwise_output, average=None)
 
-        auc = metrics.roc_auc_score(target, clipwise_output, average=None)
-        
-        statistics = {'average_precision': average_precision, 'auc': auc}
+        #auc = metrics.roc_auc_score(target, clipwise_output, average=None)
+        #accuracy = calculate_accuracy(target, clipwise_output)
+        statistics = {'average_precision': average_precision}#, 'auc': auc}
+        #statistics = {'average_precision': average_precision}
+        #statistics = {'accuracy': accuracy}
 
         return statistics
