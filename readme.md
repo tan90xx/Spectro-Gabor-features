@@ -1,4 +1,4 @@
-# Gf+: Gabor Filters + PANNs + nnAudio
+# Gf+
 
 This repo contains code for my thesis: **Ship-radiated noise recognition using spectrogram**. 
 - A mean average precision (mAP) of 71.6% is achieved using our proposed Gf+ system, outperforming the Cnn10 baseline of 64.1%.
